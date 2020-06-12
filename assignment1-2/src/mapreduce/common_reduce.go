@@ -1,5 +1,13 @@
 package mapreduce
 
+import (
+	"bufio"
+	"os"
+	"sort"
+	"encoding/json"
+	"strings"
+	//"fmt"
+)
 // doReduce does the job of a reduce worker: it reads the intermediate
 // key/value pairs (produced by the map phase) for this task, sorts the
 // intermediate key/value pairs by key, calls the user-defined reduce function
@@ -33,4 +41,49 @@ func doReduce(
 	// file.Close()
 	//
 	// Use checkError to handle errors.
+	countMap := make(map[string][]string)
+	var kArr[]string
+	for i := 0; i < nMap; i++{
+
+		fileName := reduceName(jobName, i, reduceTaskNumber)
+		file, err := os.Open(fileName)
+		if err != nil{
+			checkError(err)
+			return
+		}
+		
+		
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := scanner.Text()
+			kv := strings.Split(line, " ")
+			value, _ := countMap[kv[0]]
+			
+			value = append(value, kv[1])
+			countMap[kv[0]] = value
+		}
+		if err := scanner.Err(); err != nil {
+			checkError(err)
+		}
+		
+		file.Close()
+		//os.Remove(fileName)
+	}
+	for k, _ := range countMap{
+		kArr = append(kArr, k)
+		//fmt.Println(k, value)
+	}
+	sort.Strings(kArr)
+	mergeFile, err := os.OpenFile(mergeName(jobName, reduceTaskNumber), os.O_APPEND | os.O_WRONLY | os.O_CREATE, 0666)	
+	if err != nil{
+		checkError(err)
+		return
+	}
+	defer mergeFile.Close()
+	enc := json.NewEncoder(mergeFile)
+	for _, key := range kArr{
+		value := reduceF(key, countMap[key])
+		//fmt.Println(key, value)
+		enc.Encode(KeyValue{key, value})
+	}
 }

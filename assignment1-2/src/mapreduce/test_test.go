@@ -24,10 +24,10 @@ const (
 
 // Split in words
 func MapFunc(file string, value string) (res []KeyValue) {
-	debug("Map %v\n", value)
+	//debug("Map %v\n", value)
 	words := strings.Fields(value)
 	for _, w := range words {
-		kv := KeyValue{w, ""}
+		kv := KeyValue{w, "1"}
 		res = append(res, kv)
 	}
 	return
@@ -35,10 +35,11 @@ func MapFunc(file string, value string) (res []KeyValue) {
 
 // Just return key
 func ReduceFunc(key string, values []string) string {
-	for _, e := range values {
-		debug("Reduce %s %v\n", key, e)
-	}
-	return ""
+	// for _, e := range values {
+	// 	debug("Reduce %s %v\n", key, e)
+	// }
+	// return ""
+	return strconv.Itoa(len(values))
 }
 
 // Checks input file agaist output file: each input number should show up

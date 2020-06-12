@@ -2,6 +2,8 @@ package mapreduce
 
 import (
 	"hash/fnv"
+	"io/ioutil"
+	"os"
 )
 
 // doMap does the job of a map worker: it reads one of the input files
@@ -41,8 +43,26 @@ func doMap(
 	//
 	// Remember to close the file after you have written all the values!
 	// Use checkError to handle errors.
+		content, err := ioutil.ReadFile(inFile)
+		if err != nil {
+			checkError(err)
+			return
+		}
+		pairsMap := mapF(inFile, string(content))
+		for _, kv := range pairsMap{
+			intermediateFile := reduceName(jobName, mapTaskNumber, int(ihash(kv.Key)) % nReduce)
+			writeFile, err := os.OpenFile(intermediateFile, os.O_APPEND | os.O_WRONLY | os.O_CREATE, 0666)
+			if err != nil{
+				checkError(err)
+				continue
+			}
+			
+			writeFile.WriteString(kv.Key + " " + kv.Value + "\n")
+			writeFile.Close()
+			
+		}
+		//return
 }
-
 func ihash(s string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(s))
