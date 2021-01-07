@@ -32,10 +32,10 @@ const (
 	LEADER                  = "leader"
 	FOLLOWER                = "follower"
 	CANDIDATE               = "candidate"
-	RPCTimeoutInMs          = 20
-	ElectionTimeoutBaseInMs = 50
-	HeartbeatIntervalInMs   = 30
-	ApplyLogInternalInMs    = 30
+	RPCTimeoutInMs          = 50
+	ElectionTimeoutBaseInMs = 100
+	HeartbeatIntervalInMs   = 50
+	ApplyLogInternalInMs    = 50
 )
 
 //
@@ -153,21 +153,24 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// use lock to avoid race condition with election
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	//DPrintf("Node %v got request vote from %v with last log term %v and last log index %v", rf.me, args.CandidateID, args.LastLogTerm, args.LastLogIndex)
+
 	isOlderTermLog := args.LastLogTerm > rf.log[len(rf.log)-1].Term
-	isLongerLog := args.LastLogTerm == rf.log[len(rf.log)-1].Term && len(rf.log) >= args.LastLogIndex+1
+	isLongerLog := args.LastLogTerm == rf.log[len(rf.log)-1].Term && len(rf.log) <= args.LastLogIndex+1
 	moreUpToDateLog := isOlderTermLog || isLongerLog
-	var result bool
-	// grant vote only if the term is higher than the current term
-	if args.Term > rf.currentTerm || (args.Term == rf.currentTerm && moreUpToDateLog) {
-		rf.votedFor = args.CandidateID
+	result := false
+
+	// convert to follower and update term if the vote is from older term
+	// this make sure we don't stuck in the case the node which can be a leader gets behind some lagged node with higher term
+	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		// the node can be in the middle of election or currently a leader
-		// so if we grant the vote, it is critical to convert to follower
-		// to avoid being in an election/or leader and grant vote at the same time
 		rf.currentState = FOLLOWER
-		result = true
-	} else {
-		result = false
+
+		// grant vote only if the term is higher than the current term and with older log
+		if moreUpToDateLog {
+			rf.votedFor = args.CandidateID
+			result = true
+		}
 	}
 	//DPrintf("Node %v receives requestVote from %v in term %v and grantedVote is %v", rf.me, args.CandidateID, args.Term, result)
 	reply.VoteGranted = result
@@ -229,17 +232,21 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	reply.Term = Max(rf.currentTerm, args.Term)
 	reply.Success = false
 
-	if args.Term == rf.currentTerm && rf.currentState == LEADER {
-		DPrintf("ERROR: 2 leader get elected in the same term %v", rf.currentTerm)
+	if rf.currentState == LEADER && rf.currentTerm == args.Term {
+		DPrintf("FATAL: more than 1 leaders in same term %v", args.Term)
 		return
 	}
 
-	if args.Term < rf.currentTerm || // older term
-		args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm { // incompatible previous log
+	if rf.currentTerm > args.Term {
+		DPrintf("Node %v is receives a RPC from lower term leader node %v", rf.me, args.LeaderID)
 		return
 	}
-	//DPrintf("Node %v received valid append entries from %v with len %v", rf.me, args.LeaderID, len(args.Entries))
-	// if receive a valid append entry rpc, convert to follower
+
+	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm { // incompatible previous log
+		return
+	}
+	DPrintf("Node %v received valid append entries from %v", rf.me, args.LeaderID)
+	// if receive a valid append entry rpc, always convert to follower
 	rf.lastReceivedHeartbeat = time.Now()
 	rf.currentState = FOLLOWER
 	rf.currentTerm = args.Term
@@ -248,7 +255,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 	if len(args.Entries) == 0 {
 		rf.commitIndex = Max(Min(args.LeaderCommit, args.PrevLogIndex), rf.commitIndex)
-		DPrintf("Node %v have commit index %v", rf.me, rf.commitIndex)
+		//DPrintf("Node %v have commit index %v", rf.me, rf.commitIndex)
 		return
 	}
 
@@ -267,7 +274,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	}
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = Min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
-		DPrintf("Node %v have commit index %v", rf.me, rf.commitIndex)
+		//DPrintf("Node %v have commit index %v", rf.me, rf.commitIndex)
 	}
 
 }
@@ -478,6 +485,10 @@ func sendHeartbeat(raft *Raft, wg *sync.WaitGroup) { // add term to make sure do
 			if raft.currentState != LEADER || raft.currentTerm != term {
 				return
 			}
+			if reply.Term > args.Term {
+				raft.currentState = FOLLOWER
+				raft.currentTerm = reply.Term
+			}
 			if reply.Success == true && len(args.Entries) > 0 {
 				raft.nextIndex[s] += len(args.Entries)
 				raft.matchIndex[s] = Max(0, raft.nextIndex[s]-1)
@@ -523,7 +534,7 @@ func (rf *Raft) applyLog() {
 	for {
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
-			DPrintf("Node %v about to apply log at index %v with log len %v", rf.me, rf.lastApplied, len(rf.log))
+			//DPrintf("Node %v about to apply log at index %v with log len %v", rf.me, rf.lastApplied, len(rf.log))
 			msg := ApplyMsg{}
 			msg.Index = rf.lastApplied
 			msg.Command = rf.log[rf.lastApplied].Command
