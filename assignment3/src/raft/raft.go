@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"encoding/gob"
 	"labrpc"
 	"math/rand"
 	"sort"
@@ -33,9 +35,10 @@ const (
 	FOLLOWER                = "follower"
 	CANDIDATE               = "candidate"
 	RPCTimeoutInMs          = 50
-	ElectionTimeoutBaseInMs = 100
-	HeartbeatIntervalInMs   = 50
-	ApplyLogInternalInMs    = 50
+	ElectionTimeoutBaseInMs = 300
+	HeartbeatIntervalInMs   = 100
+	ApplyLogIntervalInMs    = 250
+	MaxEntriesToSend        = 100
 )
 
 //
@@ -53,6 +56,12 @@ type ApplyMsg struct {
 type LogEntry struct {
 	Term    int
 	Command interface{}
+}
+
+type PersistRaftState struct {
+	CurrentTerm int
+	VotedFor    int
+	Log         []LogEntry
 }
 
 //
@@ -78,8 +87,7 @@ type Raft struct {
 	lastApplied int
 	nextIndex   []int
 	matchIndex  []int
-
-	applyCh chan ApplyMsg
+	applyCh     chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -111,6 +119,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	saveState := PersistRaftState{rf.currentTerm, rf.votedFor, rf.log}
+	buffer := new(bytes.Buffer)
+	encoder := gob.NewEncoder(buffer)
+	if err := encoder.Encode(saveState); err != nil {
+		DPrintf("WARNING: Encode error msg: %v", err)
+	}
+	rf.persister.SaveRaftState(buffer.Bytes())
 }
 
 //
@@ -123,6 +138,15 @@ func (rf *Raft) readPersist(data []byte) {
 	// d := gob.NewDecoder(r)
 	// d.Decode(&rf.xxx)
 	// d.Decode(&rf.yyy)
+	buffer := bytes.NewBuffer(data)
+	encoder := gob.NewDecoder(buffer)
+	object := &PersistRaftState{0, -1, []LogEntry{LogEntry{-1, nil}}}
+	if err := encoder.Decode(object); err != nil {
+		DPrintf("WARNING: Decode error msg: %v", err)
+	}
+	rf.currentTerm = object.CurrentTerm
+	rf.votedFor = object.VotedFor
+	rf.log = object.Log
 }
 
 //
@@ -165,7 +189,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.currentState = FOLLOWER
-
+		rf.votedFor = -1
 		// grant vote only if the term is higher than the current term and with older log
 		if moreUpToDateLog {
 			rf.votedFor = args.CandidateID
@@ -215,8 +239,10 @@ type AppendEntriesArgs struct {
 //
 type AppendEntriesReply struct {
 	// Your data here.
-	Term    int
-	Success bool
+	Term                  int
+	Success               bool
+	ConflictTerm          int
+	FirstConflictLogIndex int
 }
 
 // make RPC call to append entry
@@ -229,6 +255,8 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	//DPrintf("Node %v receive append entries with term %v and its current term is %v", rf.me, args.Term, rf.currentTerm)
 	// discard append entry with lower term
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	reply.Term = Max(rf.currentTerm, args.Term)
 	reply.Success = false
 
@@ -242,10 +270,24 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		return
 	}
 
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm { // incompatible previous log
+	if args.PrevLogIndex >= len(rf.log) { // incompatible previous log
+		reply.ConflictTerm = -1
+		reply.FirstConflictLogIndex = len(rf.log) - 1
+		DPrintf("Node %v received RPC but log too short", rf.me)
 		return
 	}
-	DPrintf("Node %v received valid append entries from %v", rf.me, args.LeaderID)
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		DPrintf("Node %v received RPC but it's conflict", rf.me)
+		conflictTerm := rf.log[args.PrevLogIndex].Term
+		firstConflictLogIdx := args.PrevLogIndex
+		for rf.log[firstConflictLogIdx-1].Term == conflictTerm {
+			firstConflictLogIdx--
+		}
+		reply.ConflictTerm = conflictTerm
+		reply.FirstConflictLogIndex = firstConflictLogIdx
+		return
+	}
+	//DPrintf("Node %v received valid append entries from %v", rf.me, args.LeaderID)
 	// if receive a valid append entry rpc, always convert to follower
 	rf.lastReceivedHeartbeat = time.Now()
 	rf.currentState = FOLLOWER
@@ -338,12 +380,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here.
-	rf.currentTerm = 0
-	rf.votedFor = -1
 	rf.currentState = FOLLOWER
 	rf.lastReceivedHeartbeat = time.Now()
-	rf.log = make([]LogEntry, 1)
-	rf.log[0] = LogEntry{-1, nil}
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -427,6 +465,7 @@ func startElection(raft *Raft, wg *sync.WaitGroup) {
 			raft.nextIndex[i] = lastLogIndex
 			raft.matchIndex[i] = 0
 		}
+		//raft.Start(nil) // no-op command
 	} else { // If the candidate doesn't get the majority votes, reset timeout
 		electionTimeout := ElectionTimeoutBaseInMs + rand.Intn(ElectionTimeoutBaseInMs)
 		time.Sleep(time.Duration(electionTimeout) * time.Millisecond)
@@ -456,7 +495,7 @@ func sendHeartbeat(raft *Raft, wg *sync.WaitGroup) { // add term to make sure do
 		return
 	}
 
-	DPrintf("Node %v sending AppendEntry in term %v", raft.me, term)
+	//DPrintf("Node %v sending AppendEntry in term %v", raft.me, term)
 	matchIndices := []int{len(raft.log) - 1}
 	//Send heartbeats
 	for server := 0; server < len(raft.peers); server++ {
@@ -475,7 +514,8 @@ func sendHeartbeat(raft *Raft, wg *sync.WaitGroup) { // add term to make sure do
 			args.PrevLogTerm = raft.log[args.PrevLogIndex].Term
 
 			if args.PrevLogIndex+1 < len(raft.log) {
-				args.Entries = append(args.Entries, raft.log[args.PrevLogIndex+1])
+				len := Min(100, len(raft.log)-args.PrevLogIndex-1)
+				args.Entries = raft.log[args.PrevLogIndex+1 : args.PrevLogIndex+1+len]
 			}
 
 			reply := &AppendEntriesReply{}
@@ -488,19 +528,24 @@ func sendHeartbeat(raft *Raft, wg *sync.WaitGroup) { // add term to make sure do
 			if reply.Term > args.Term {
 				raft.currentState = FOLLOWER
 				raft.currentTerm = reply.Term
+				return
 			}
 			if reply.Success == true && len(args.Entries) > 0 {
 				raft.nextIndex[s] += len(args.Entries)
 				raft.matchIndex[s] = Max(0, raft.nextIndex[s]-1)
 			} else if reply.Success == false && reply.Term == args.Term {
-				raft.nextIndex[s] = Min(1, raft.nextIndex[s]-1)
+				if reply.ConflictTerm == -1 || raft.log[reply.FirstConflictLogIndex].Term == reply.ConflictTerm {
+					raft.nextIndex[s] = reply.FirstConflictLogIndex + 1
+				} else {
+					raft.nextIndex[s] = reply.FirstConflictLogIndex
+				}
 			}
 		}(server)
 	}
 	// find the majority match index
 	sort.Ints(matchIndices)
 	majorityLogIndex := matchIndices[len(matchIndices)/2]
-	if majorityLogIndex > raft.commitIndex {
+	if majorityLogIndex > raft.commitIndex && raft.log[majorityLogIndex].Term == term {
 		raft.commitIndex = majorityLogIndex
 		DPrintf("Node %v, new commit index %v from %v and log len %v", raft.me, majorityLogIndex, matchIndices, len(raft.log))
 	}
@@ -532,16 +577,16 @@ func raftRountine(raft *Raft) {
 
 func (rf *Raft) applyLog() {
 	for {
-		for rf.commitIndex > rf.lastApplied {
+		commitIndex := rf.commitIndex
+		rf.persist()
+		for commitIndex > rf.lastApplied {
 			rf.lastApplied++
-			//DPrintf("Node %v about to apply log at index %v with log len %v", rf.me, rf.lastApplied, len(rf.log))
 			msg := ApplyMsg{}
 			msg.Index = rf.lastApplied
 			msg.Command = rf.log[rf.lastApplied].Command
-
 			rf.applyCh <- msg
 			DPrintf("Node %v done applying log at index %v", rf.me, rf.lastApplied)
 		}
-		time.Sleep(ApplyLogInternalInMs * time.Millisecond)
+		time.Sleep(ApplyLogIntervalInMs * time.Millisecond)
 	}
 }
