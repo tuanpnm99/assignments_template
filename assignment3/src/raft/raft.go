@@ -35,10 +35,10 @@ const (
 	FOLLOWER                = "follower"
 	CANDIDATE               = "candidate"
 	RPCTimeoutInMs          = 50
-	ElectionTimeoutBaseInMs = 300
-	HeartbeatIntervalInMs   = 100
-	ApplyLogIntervalInMs    = 250
-	MaxEntriesToSend        = 100
+	ElectionTimeoutBaseInMs = 600
+	HeartbeatIntervalInMs   = 200
+	ApplyLogIntervalInMs    = 100
+	MaxEntriesToSend        = 1000
 )
 
 //
@@ -119,7 +119,9 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	rf.mu.Lock()
 	saveState := PersistRaftState{rf.currentTerm, rf.votedFor, rf.log}
+	rf.mu.Unlock()
 	buffer := new(bytes.Buffer)
 	encoder := gob.NewEncoder(buffer)
 	if err := encoder.Encode(saveState); err != nil {
@@ -315,7 +317,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		rf.log[i+curLogIndex] = args.Entries[i]
 	}
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = Min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+		Min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
 		//DPrintf("Node %v have commit index %v", rf.me, rf.commitIndex)
 	}
 
@@ -452,13 +454,15 @@ func startElection(raft *Raft, wg *sync.WaitGroup) {
 	}
 	DPrintf("Node %v got %v votes for term %v election", raft.me, totalVotes, newTerm)
 	// Make sure the state is consistent before and after receiving vote replies
-	if raft.currentState != CANDIDATE || raft.currentTerm != newTerm {
-		DPrintf("Node %v aborts election with state %v and term %v", raft.me, raft.currentState, raft.currentTerm)
+	currentState, currentTerm := raft.getCurrentStateAndTerm()
+	if currentState != CANDIDATE || currentTerm != newTerm {
+		DPrintf("Node %v aborts election with state %v and term %v", raft.me, currentState, currentTerm)
 		return
 	}
 
 	if totalVotes*2 > totalPeers { // Win election with majority votes
-		raft.currentState = LEADER
+		raft.setCurrentState(LEADER)
+
 		DPrintf("Node %v becomes leader", raft.me)
 		lastLogIndex := len(raft.log)
 		for i := 0; i < totalPeers; i++ {
@@ -478,25 +482,23 @@ func convertToCandidate(raft *Raft, wg *sync.WaitGroup) {
 	electionTimeout := ElectionTimeoutBaseInMs + rand.Intn(ElectionTimeoutBaseInMs)
 	time.Sleep(time.Duration(electionTimeout) * time.Millisecond)
 	// If receive valid heartbeat during the sleep, remain as follower
-	if time.Now().Sub(raft.lastReceivedHeartbeat) < time.Duration(electionTimeout)*time.Millisecond {
+	if time.Now().Sub(raft.getLastHeartbeatTime()) < time.Duration(electionTimeout)*time.Millisecond {
 		return
 	}
-	raft.currentState = CANDIDATE
+	raft.setCurrentState(CANDIDATE)
 }
 
 func sendHeartbeat(raft *Raft, wg *sync.WaitGroup) { // add term to make sure don't send heartbeat in different term
 	defer wg.Done()
-	raft.mu.Lock()
-	state := raft.currentState
-	term := raft.currentTerm
-	raft.mu.Unlock()
 
+	state, term := raft.getCurrentStateAndTerm()
 	if state != LEADER || term != raft.currentTerm {
 		return
 	}
 
 	//DPrintf("Node %v sending AppendEntry in term %v", raft.me, term)
-	matchIndices := []int{len(raft.log) - 1}
+	matchIndices := []int{}
+
 	//Send heartbeats
 	for server := 0; server < len(raft.peers); server++ {
 		if server == raft.me {
@@ -504,32 +506,34 @@ func sendHeartbeat(raft *Raft, wg *sync.WaitGroup) { // add term to make sure do
 		}
 		matchIndices = append(matchIndices, raft.matchIndex[server])
 		go func(s int) {
+			raft.mu.Lock()
 			args := AppendEntriesArgs{}
 			args.Term = term
 			args.LeaderID = raft.me
 			args.PrevLogIndex = Min(len(raft.log)-1, raft.nextIndex[s]-1)
 			args.LeaderCommit = raft.commitIndex
-
-			//DPrintf("Node %v sending RPC, Prev Log Index for node %v is %v", raft.me, s, args.PrevLogIndex)
 			args.PrevLogTerm = raft.log[args.PrevLogIndex].Term
-
-			if args.PrevLogIndex+1 < len(raft.log) {
-				len := Min(100, len(raft.log)-args.PrevLogIndex-1)
-				args.Entries = raft.log[args.PrevLogIndex+1 : args.PrevLogIndex+1+len]
-			}
+			numEntriesToSend := Max(0, Min(MaxEntriesToSend, len(raft.log)-args.PrevLogIndex-1))
+			args.Entries = raft.log[args.PrevLogIndex+1 : args.PrevLogIndex+1+numEntriesToSend]
+			raft.mu.Unlock()
 
 			reply := &AppendEntriesReply{}
 			if raft.sendAppendEntries(s, args, reply) == false {
 				return
 			}
-			if raft.currentState != LEADER || raft.currentTerm != term {
+
+			currentState, currentTerm := raft.getCurrentStateAndTerm()
+			if currentState != LEADER || currentTerm != term {
 				return
 			}
+			raft.mu.Lock()
+			defer raft.mu.Unlock()
 			if reply.Term > args.Term {
 				raft.currentState = FOLLOWER
 				raft.currentTerm = reply.Term
 				return
 			}
+
 			if reply.Success == true && len(args.Entries) > 0 {
 				raft.nextIndex[s] += len(args.Entries)
 				raft.matchIndex[s] = Max(0, raft.nextIndex[s]-1)
@@ -542,14 +546,22 @@ func sendHeartbeat(raft *Raft, wg *sync.WaitGroup) { // add term to make sure do
 			}
 		}(server)
 	}
+	raft.checkCommitIndex(matchIndices, term)
+	time.Sleep(HeartbeatIntervalInMs * time.Millisecond)
+}
+
+func (rf *Raft) checkCommitIndex(matchIndices []int, term int) {
 	// find the majority match index
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	matchIndices = append(matchIndices, len(rf.log)-1)
 	sort.Ints(matchIndices)
 	majorityLogIndex := matchIndices[len(matchIndices)/2]
-	if majorityLogIndex > raft.commitIndex && raft.log[majorityLogIndex].Term == term {
-		raft.commitIndex = majorityLogIndex
-		DPrintf("Node %v, new commit index %v from %v and log len %v", raft.me, majorityLogIndex, matchIndices, len(raft.log))
+
+	if majorityLogIndex > rf.commitIndex && majorityLogIndex < len(rf.log) && rf.log[majorityLogIndex].Term == term {
+		rf.commitIndex = majorityLogIndex
+		DPrintf("Node %v, new commit index %v from %v and log len %v", rf.me, majorityLogIndex, matchIndices, len(rf.log))
 	}
-	time.Sleep(HeartbeatIntervalInMs * time.Millisecond)
 }
 
 func raftRountine(raft *Raft) {
@@ -557,16 +569,17 @@ func raftRountine(raft *Raft) {
 	go raft.applyLog()
 	// use wait group to synchronize between different go routines with the main raft routine
 	wg := sync.WaitGroup{}
-	prev := raft.currentState
+	prev, _ := raft.getCurrentStateAndTerm()
 	for {
 		wg.Add(1)
-		if raft.currentState != prev {
-			DPrintf("Node %v in raft routine with state %v in term %v", raft.me, raft.currentState, raft.currentTerm)
-			prev = raft.currentState
+		currentState, currentTerm := raft.getCurrentStateAndTerm()
+		if currentState != prev {
+			DPrintf("Node %v in raft routine with state %v in term %v", raft.me, currentState, currentTerm)
+			prev = currentState
 		}
-		if raft.currentState == LEADER {
+		if currentState == LEADER {
 			go sendHeartbeat(raft, &wg)
-		} else if raft.currentState == FOLLOWER {
+		} else if currentState == FOLLOWER {
 			go convertToCandidate(raft, &wg)
 		} else { // candidate
 			go startElection(raft, &wg)
@@ -577,16 +590,48 @@ func raftRountine(raft *Raft) {
 
 func (rf *Raft) applyLog() {
 	for {
-		commitIndex := rf.commitIndex
+		commitIndex := rf.getCommitIndex()
 		rf.persist()
 		for commitIndex > rf.lastApplied {
 			rf.lastApplied++
 			msg := ApplyMsg{}
 			msg.Index = rf.lastApplied
+			rf.mu.Lock()
 			msg.Command = rf.log[rf.lastApplied].Command
+			rf.mu.Unlock()
 			rf.applyCh <- msg
 			DPrintf("Node %v done applying log at index %v", rf.me, rf.lastApplied)
 		}
 		time.Sleep(ApplyLogIntervalInMs * time.Millisecond)
 	}
+}
+
+func (rf *Raft) setCurrentState(state string) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.currentState = state
+}
+
+func (rf *Raft) getCurrentStateAndTerm() (string, int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentState, rf.currentTerm
+}
+
+func (rf *Raft) getLastHeartbeatTime() time.Time {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.lastReceivedHeartbeat
+}
+
+func (rf *Raft) setCommitIndex(idx int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.commitIndex = idx
+}
+
+func (rf *Raft) getCommitIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.commitIndex
 }
