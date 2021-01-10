@@ -1,13 +1,32 @@
 package raftkv
 
-import "labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"labrpc"
+	"math/big"
+	"time"
+)
 
+const (
+	GET              = "GET"
+	APPEND           = "APPEND"
+	PUT              = "PUT"
+	MaxQueueCapacity = 10000
+	GETRPC           = "RaftKV.Get"
+	PUTAPPENDRPC     = "RaftKV.PutAppend"
+)
+
+type Operation struct {
+	key        string
+	value      string
+	opType     string
+	outChannel chan string
+}
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	queue chan Operation
 }
 
 func nrand() int64 {
@@ -21,6 +40,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.queue = make(chan Operation, MaxQueueCapacity)
+	go ck.workerRoutine()
 	return ck
 }
 
@@ -39,7 +60,11 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	outChannel := make(chan string, 1)
+	ck.addOperation(Operation{key, "", GET, outChannel})
+	result := <-outChannel
+	return result
+
 }
 
 //
@@ -52,13 +77,59 @@ func (ck *Clerk) Get(key string) string {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 //
-func (ck *Clerk) PutAppend(key string, value string, op string) {
+func (ck *Clerk) addOperation(operation Operation) {
 	// You will have to modify this function.
+	ck.queue <- operation
+	return
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	outChannel := make(chan string, 1)
+	ck.addOperation(Operation{key, value, PUT, outChannel})
+	<-outChannel
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	outChannel := make(chan string, 1)
+	ck.addOperation(Operation{key, value, APPEND, outChannel})
+	<-outChannel
+}
+
+func (ck *Clerk) workerRoutine() {
+	for {
+		operation := <-ck.queue
+		isTimeout := make(chan bool, 1)
+		var result string
+		for {
+			for server := 0; server < len(ck.servers); server++ {
+				go func(s int) {
+					wrongLeader := true
+					if operation.opType == GET {
+						reply := &GetReply{}
+						ck.servers[s].Call(GETRPC, &GetArgs{operation.key}, reply)
+						result = reply.Value
+						wrongLeader = reply.WrongLeader
+					} else {
+						reply := &GetReply{}
+						ck.servers[s].Call(PUTAPPENDRPC, &PutAppendArgs{operation.key, operation.value, operation.opType}, reply)
+						wrongLeader = reply.WrongLeader
+					}
+					if wrongLeader == true {
+						return
+					}
+					isTimeout <- false
+
+				}(server)
+			}
+			go func() {
+				time.Sleep(1000 * time.Millisecond)
+				isTimeout <- true
+			}()
+
+			if <-isTimeout == false {
+				break
+			}
+			//DPrintf("Timeout, resend command %v", operation)
+		}
+		operation.outChannel <- result
+	}
 }
