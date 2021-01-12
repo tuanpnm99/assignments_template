@@ -26,7 +26,10 @@ type Operation struct {
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	queue chan Operation
+	queue               chan Operation
+	clientID            int64
+	operationID         int
+	lastContactedServer int
 }
 
 func nrand() int64 {
@@ -41,6 +44,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.queue = make(chan Operation, MaxQueueCapacity)
+	ck.operationID = 1
+	ck.clientID = time.Now().UnixNano()
+	ck.lastContactedServer = int(nrand()) % len(ck.servers)
 	go ck.workerRoutine()
 	return ck
 }
@@ -97,39 +103,65 @@ func (ck *Clerk) Append(key string, value string) {
 func (ck *Clerk) workerRoutine() {
 	for {
 		operation := <-ck.queue
-		isTimeout := make(chan bool, 1)
-		var result string
+		result := ""
+		ID := CommandID{ck.clientID, ck.operationID}
+		timeoutCnt := 0
 		for {
-			for server := 0; server < len(ck.servers); server++ {
-				go func(s int) {
-					wrongLeader := true
-					if operation.opType == GET {
-						reply := &GetReply{}
-						ck.servers[s].Call(GETRPC, &GetArgs{operation.key}, reply)
-						result = reply.Value
-						wrongLeader = reply.WrongLeader
-					} else {
-						reply := &GetReply{}
-						ck.servers[s].Call(PUTAPPENDRPC, &PutAppendArgs{operation.key, operation.value, operation.opType}, reply)
-						wrongLeader = reply.WrongLeader
-					}
-					if wrongLeader == true {
+			timeout := make(chan bool, 1)
+			rpc := make(chan bool, 1)
+			rpcResult := ""
+			wrongLeader := true
+			valid := false
+			go func(s int) {
+				if operation.opType == GET {
+					reply := &GetReply{}
+					if !ck.servers[s].Call(GETRPC, &GetArgs{operation.key, ID}, reply) {
 						return
 					}
-					isTimeout <- false
+					rpcResult = reply.Value
+					wrongLeader = reply.WrongLeader
+				} else {
+					reply := &GetReply{}
+					if !ck.servers[s].Call(PUTAPPENDRPC, &PutAppendArgs{operation.key, operation.value, operation.opType, ID}, reply) {
+						return
+					}
+					wrongLeader = reply.WrongLeader
 
-				}(server)
-			}
+				}
+
+				//DPrintf("Result for %v is from node %v and ID %v", operation, s, ID)
+				rpc <- true
+
+			}(ck.lastContactedServer)
 			go func() {
-				time.Sleep(1000 * time.Millisecond)
-				isTimeout <- true
+				time.Sleep(300 * time.Millisecond)
+				timeout <- true
 			}()
-
-			if <-isTimeout == false {
+			select {
+			case <-timeout:
+				timeoutCnt++
+				if timeoutCnt == 1 {
+					ck.lastContactedServer = (ck.lastContactedServer + 1) % len(ck.servers)
+					timeoutCnt = 0
+				}
+			case <-rpc:
+				if wrongLeader == false {
+					//DPrintf("Right leader, result is %v", rpcResult)
+					valid = true
+					break
+				}
+				ck.lastContactedServer = (ck.lastContactedServer + 1) % len(ck.servers)
+				timeoutCnt = 0
+			}
+			if valid {
+				result = rpcResult
 				break
 			}
-			//DPrintf("Timeout, resend command %v", operation)
+			//DPrintf("Timeout, resend to node %v command %v %v", ck.lastContactedServer, operation, ID)
 		}
+
+		DPrintf("Result for %v and ID %v is %v", operation, ID, result)
 		operation.outChannel <- result
+		ck.operationID++
 	}
 }

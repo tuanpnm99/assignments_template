@@ -8,11 +8,11 @@ import (
 	"sync"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
-		log.Printf("[SERVER]"+format, a...)
+		log.Printf(format, a...)
 	}
 	return
 }
@@ -24,6 +24,7 @@ type Op struct {
 	Key       string
 	Value     string
 	Operation string
+	ID        CommandID
 }
 
 type RaftKV struct {
@@ -35,34 +36,52 @@ type RaftKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	commandID       int
-	nextAppliedID   int
-	raftState       map[string]string
-	applyMsgMapping map[int]chan string
+	commandID             int
+	nextAppliedID         int
+	raftState             map[string]string
+	applyMsgMapping       map[int]chan string
+	executedResult        map[CommandID]string
+	receivedCommand       map[CommandID]int
+	previousCommittedTerm int
 }
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
+	//DPrintf("Node %v server receive command %v", kv.me, args)
+
 	// Your code here.
-	commandID, valid := kv.sendCommand(Op{args.Key, "", GET})
-	if valid == false {
+	reply.WrongLeader = false
+	if ok, result := kv.isExecuted(args.ID); ok {
+		DPrintf("Command %v has been executed", args.ID)
+		reply.Value = result
+		return
+	}
+	ok, commandID := kv.sendCommand(Op{args.Key, "", GET, args.ID})
+	if ok == false {
 		reply.WrongLeader = true
 		return
 	}
 	result := kv.getCommandResult(commandID)
-	reply.WrongLeader = false
 	reply.Value = result
+	DPrintf("Result value %v for args %v", result, args)
 	return
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	//DPrintf("Node %v server receive command %v", kv.me, args)
+
 	// Your code here.
-	commandID, valid := kv.sendCommand(Op{args.Key, args.Value, args.Op})
-	if valid == false {
+	reply.WrongLeader = false
+	if ok, _ := kv.isExecuted(args.ID); ok {
+		DPrintf("Command %v has been executed", args.ID)
+		return
+	}
+
+	ok, commandID := kv.sendCommand(Op{args.Key, args.Value, args.Op, args.ID})
+	if ok == false {
 		reply.WrongLeader = true
 		return
 	}
 	kv.getCommandResult(commandID)
-	reply.WrongLeader = false
 	return
 }
 
@@ -107,6 +126,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.nextAppliedID = 1
 	kv.applyMsgMapping = make(map[int]chan string)
 	kv.raftState = make(map[string]string)
+	kv.receivedCommand = make(map[CommandID]int)
+	kv.executedResult = make(map[CommandID]string)
 	go kv.applyMessage()
 	return kv
 }
@@ -115,7 +136,11 @@ func (kv *RaftKV) applyMessage() {
 	for {
 		applyMsg := <-kv.applyCh
 		commitIndex := applyMsg.Index
-		operation := applyMsg.Command.(Op)
+		operation, valid := applyMsg.Command.(Op)
+		kv.previousCommittedTerm = applyMsg.Term
+		if !valid {
+			continue
+		}
 		result := ""
 		if operation.Operation == GET {
 			result, _ = kv.raftState[operation.Key]
@@ -125,22 +150,45 @@ func (kv *RaftKV) applyMessage() {
 			value, _ := kv.raftState[operation.Key]
 			kv.raftState[operation.Key] = value + operation.Value
 		}
-		kv.applyMsgMapping[commitIndex] <- result
+		kv.mu.Lock()
+		kv.executedResult[operation.ID] = result
+		//if outChannel, ok := kv.applyMsgMapping[commitIndex]
+		//DPrintf("Node %v server waits for commit %v", kv.me, commitIndex)
+		if outChannel, ok := kv.applyMsgMapping[commitIndex]; ok {
+			outChannel <- result
+		}
+		kv.mu.Unlock()
+		//DPrintf("Node %v server waits done waiting for commit %v", kv.me, commitIndex)
 	}
 }
 
-func (kv *RaftKV) sendCommand(operation Op) (int, bool) {
+func (kv *RaftKV) sendCommand(operation Op) (bool, int) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
+	if commitIndex, received := kv.receivedCommand[operation.ID]; received == true {
+		//DPrintf("Command %v has already received with index %v", operation, commitIndex)
+		return true, commitIndex
+	}
 	valid := false
+	currentState, currentTerm := kv.rf.GetCurrentStateAndTerm()
+
+	if currentState != "leader" || currentTerm > kv.previousCommittedTerm {
+		DPrintf("Node %v refuse command, state %v currentTerm %v prevCommittedTerm %v", kv.me, currentState, currentTerm, kv.previousCommittedTerm)
+		return false, -1
+	}
+	DPrintf("Node %v accept command at currentTerm %v prevCommittedTerm %v", kv.me, currentTerm, kv.previousCommittedTerm)
+
 	commitIndex, _, isLeader := kv.rf.Start(operation)
+
 	if isLeader == true {
 		valid = true
+		kv.receivedCommand[operation.ID] = commitIndex
 		kv.applyMsgMapping[commitIndex] = make(chan string, 1)
-		//DPrintf("Index %v for command op `%v`, key `%v`, value `%v`", commitIndex, operation.Operation, operation.Key, operation.Value)
+		DPrintf("Node %v, Index %v for command op `%v`, key `%v`, value `%v` and ID %v", kv.me, commitIndex, operation.Operation, operation.Key, operation.Value, operation.ID)
 	}
 
-	return commitIndex, valid
+	return valid, commitIndex
 }
 
 func (kv *RaftKV) getCommandResult(commitIndex int) string {
@@ -149,4 +197,11 @@ func (kv *RaftKV) getCommandResult(commitIndex int) string {
 	defer kv.mu.Unlock()
 	delete(kv.applyMsgMapping, commitIndex)
 	return result
+}
+
+func (kv *RaftKV) isExecuted(ID CommandID) (bool, string) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	result, executed := kv.executedResult[ID]
+	return executed, result
 }
